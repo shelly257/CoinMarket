@@ -1,0 +1,110 @@
+import json
+from collections import namedtuple
+import requests
+
+from django.shortcuts import get_object_or_404
+from django.core.cache import cache
+from rest_framework import status
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+from .tasks import fetch_coin_data  # Import background task
+
+# Consider using a custom user model for authentication
+from django.contrib.auth.models import User
+
+# Define custom permission for authenticated users only
+from rest_framework.permissions import BasePermission
+
+class IsAuthenticated(BasePermission):
+    """
+    Allows access only to authenticated users.
+    """
+
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated
+
+# Named tuple for data structure
+CoinData = namedtuple('CoinData', ['name', 'price', 'market_cap', 'change_24h'])
+
+# Base class for CoinMarketCap scraper (abstract)
+class CoinMarketCapScraper(object):
+    def __init__(self, base_url, cache_timeout=3600):  # Default cache timeout: 1 hour
+        self.base_url = base_url
+        self.cache_timeout = cache_timeout
+
+    def fetch_data(self, coin_acronyms):
+        """
+        Fetches coin data from CoinMarketCap.
+        Considers caching for efficiency.
+        """
+        cache_key = f'coin_data_{",".join(coin_acronyms)}'
+
+        data = cache.get(cache_key)
+        if data is None:
+            data = self._scrape_data(coin_acronyms)
+            cache.set(cache_key, data, timeout=self.cache_timeout)
+
+        return data
+
+    def _scrape_data(self, coin_acronyms):
+        """
+        Abstract method for scraping data from CoinMarketCap.
+        Subclasses must implement this.
+        """
+        raise NotImplementedError
+
+
+# Concrete scraper using requests library (more efficient)
+class RequestsCoinMarketCapScraper(CoinMarketCapScraper):
+    def _scrape_data(self, coin_acronyms):
+        url = f'{self.base_url}/coins/?ids={",".join(coin_acronyms)}'
+        response = requests.get(url)
+        response.raise_for_status()  # Raise exception for non-200 status codes
+
+        data = json.loads(response.content)
+        return self._process_data(data)
+
+    def _process_data(self, data):
+        """
+        Processes scraped data into CoinData namedtuples.
+        """
+        coin_data = []
+        for coin_id, coin_info in data.items():
+            name = coin_info['name']
+            price = coin_info['current_price']
+            market_cap = coin_info['market_cap']
+            change_24h = coin_info['price_change_percentage_24h']
+            coin_data.append(CoinData(name, price, market_cap, change_24h))
+        return coin_data
+
+
+# Concrete scraper using Selenium (optional, for complex scraping)
+# class SeleniumCoinMarketCapScraper(CoinMarketCapScraper):
+#     from selenium import webdriver
+#
+#     def __init__(self, base_url, headless=True):  # Allow headless option
+#         super().__init__(base_url)
+#         self.headless = headless
+#
+#     def _scrape_data(self, coin_acronyms):
+#         # Implement Selenium scraping logic
+#         pass
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])  # Enforce authentication
+def get_coin_data(request, format=None):
+    """
+    API endpoint to fetch coin data by comma-separated list of acronyms.
+    """
+    coin_acronyms = request.GET.get('acronyms')
+    if not coin_acronyms:
+        return Response({'error': 'Missing "acronyms" parameter'}, status=status.HTTP_400_BAD_REQUEST)
+
+    coin_acronyms = coin_acronyms.split(',')
+
+    # Fetch data asynchronously using Celery (consider for large datasets)
+    # coin_data = fetch_coin_data.delay(coin_acronyms).get()
+
+    # Synchronous data fetching (can be replaced
